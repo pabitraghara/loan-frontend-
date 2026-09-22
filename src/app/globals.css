@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  @apply bg-sand text-slate-900 antialiased;
+}
+
+/* 16px minimum on inputs stops iOS Safari zooming on focus. */
+input,
+select,
+textarea {
+  font-size: 16px;
+}
+
+*:focus-visible {
+  @apply outline-none ring-2 ring-brand-500/40;
+}
