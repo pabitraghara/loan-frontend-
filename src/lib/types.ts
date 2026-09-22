@@ -70,6 +70,8 @@ export interface ApiError {
   suggestions?: { email?: string };
   lockoutUntil?: string;
   applicationId?: string;
+  /** Which screen a field error belongs to, so the form can reopen it. */
+  step?: number;
 }
 
 export interface Offer {
@@ -79,73 +81,91 @@ export interface Offer {
   installment: number;
 }
 
-export interface Step1Response {
-  applicationId: string;
-  status: string;
-  prequalified: boolean;
-  nextStep: number | null;
-  offer: Offer | null;
-  reviewFlags: string[];
-  resumeToken: string;
-  emailSuggestion: string | null;
-  availableTerms: number[] | null;
+/**
+ * The whole application, as one request body.
+ *
+ * The form is three screens, but nothing is posted until the applicant
+ * submits on the last one, so every field below travels together to
+ * POST /applications/submit. Each screen contributes a `Partial` of this.
+ */
+export interface SubmitRequest {
+  // ---- Screen 1: loan request, contact, residence, income
+  loanAmount: number;
+  loanPurpose: string;
+  loanPurposeOther?: string;
+  loanTermMonths: number;
+  firstName: string;
+  middleInitial?: string;
+  lastName: string;
+  suffix?: string;
+  email: string;
+  confirmEmail: string;
+  phone: string;
+  dateOfBirth: string;
+  streetAddress: string;
+  aptUnit?: string;
+  city: string;
+  state: string;
+  zipCode: string;
+  timeAtCurrentAddress: string;
+  housingStatus: string;
+  monthlyHousingPayment?: number;
+  employmentStatus: string;
+  primaryIncomeType?: string;
+  employerName?: string;
+  jobTitle?: string;
+  employerPhone?: string;
+  timeAtCurrentJob?: string;
+  netMonthlyIncome?: number;
+  payFrequency: string;
+  nextPayDate?: string;
+  directDeposit: boolean;
+  additionalMonthlyIncome?: number;
+  additionalIncomeSource?: string;
+
+  // ---- Screen 2: identity
+  ssn: string;
+  confirmSsn: string;
+  driversLicenseNumber: string;
+  dlIssuingState: string;
+  dlExpirationDate: string;
+
+  // ---- Screen 3: bank & funding
+  routingNumber: string;
+  bankName?: string;
+  accountNumber: string;
+  confirmAccountNumber: string;
+  accountType: string;
+  accountStatusSelfReported: string;
+  accountAge: string;
+
+  /** Every checkbox from all three screens, in one array. */
+  consents: ConsentPayload[];
+  tracking?: TrackingPayload;
 }
 
-export interface Step2Response {
-  applicationId: string;
-  status: string;
-  approved: boolean;
-  manualReview?: boolean;
-  nextStep: number | null;
-  offer?: Offer | null;
-  resumeToken?: string;
-}
+/** What one screen contributes to the request body. */
+export type SubmitRequestPart = Partial<SubmitRequest>;
 
-export interface Step3Response {
+/**
+ * The one response the form gets back.
+ *
+ * No decision is carried here: a completed application is stored and lands at
+ * bank verification pending, and what is left for the applicant is confirming
+ * their bank account from the email we have just sent.
+ */
+export interface SubmitResponse {
   applicationId: string;
   status: string;
-  bankName: string | null;
-  accountNumberMasked: string;
-  bankVerificationRequired: boolean;
+  /** Human-facing status, e.g. "Bank Verification Pending". */
+  statusLabel: string;
+  loanAmount?: number;
+  loanTermMonths?: number;
+  bankName?: string | null;
+  accountNumberMasked?: string;
+  bankVerificationRequired?: boolean;
   /** Single-use link, so the applicant can verify without leaving the flow. */
   bankVerificationUrl?: string;
   /** How many drip emails were scheduled - six, two a day for three days. */
-  dripScheduled: number;
-  dripSchedule?: Array<{
-    sequence: number;
-    day: number;
-    emailType: string;
-    scheduledAt: string;
-    status: string;
-  }>;
-}
-
-/** Saved state returned by the resume link - step 2/3 come back masked only. */
-export interface ResumeState {
-  applicationId: string;
-  status: string;
-  currentStep: number;
-  highestStepReached: number;
-  prequalified: boolean;
-  approved: boolean;
-  bankVerificationStatus: string;
-  offer: Offer | null;
-  step1: Record<string, any>;
-  step2: {
-    completed: boolean;
-    ssnMasked: string | null;
-    driversLicenseMasked: string | null;
-    dlIssuingState: string | null;
-    dlExpirationDate: string | null;
-  };
-  step3: {
-    completed: boolean;
-    bankName: string | null;
-    routingNumberMasked: string | null;
-    accountNumberMasked: string | null;
-    accountType: string | null;
-    accountStatusSelfReported: string | null;
-    accountAge: string | null;
-  };
-  derived: Record<string, any>;
+  dripScheduled?: number;
 }

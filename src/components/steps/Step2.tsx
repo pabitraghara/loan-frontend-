@@ -1,11 +1,14 @@
 'use client';
 
-import { useState } from 'react';
-import { api, ApiRequestError } from '@/lib/api';
-import { getTracking } from '@/lib/tracking';
+import { useEffect, useState } from 'react';
 import { digitsOnly, formatSsn } from '@/lib/format';
 import { validateFutureDate, validateSsn, required } from '@/lib/validation';
-import type { ConsentTemplate, FieldErrors, LookupOptions, Step2Response } from '@/lib/types';
+import type {
+  ConsentTemplate,
+  FieldErrors,
+  LookupOptions,
+  SubmitRequestPart,
+} from '@/lib/types';
 import { SectionCard } from '../SectionCard';
 import { TrustMarkers } from '../TrustMarkers';
 import { ConsentCheckbox } from '../ConsentCheckbox';
@@ -13,40 +16,85 @@ import { TextField } from '../fields/TextField';
 import { SelectField } from '../fields/SelectField';
 import { DateField } from '../fields/DateField';
 
+/** What the wizard holds on to so Back can put this screen back as it was. */
+export interface Step2Snapshot {
+  ssn: string;
+  confirmSsn: string;
+  driversLicenseNumber: string;
+  dlIssuingState: string;
+  dlExpirationDate: string;
+  consents: Record<string, boolean>;
+}
+
 interface Props {
-  applicationId: string;
   options: LookupOptions;
   consentTemplates: ConsentTemplate[];
   /** Residence state - field 36 defaults to it, override allowed. */
   residenceState?: string;
-  onComplete: (result: Step2Response) => void;
+  /** Whatever was on this screen last time, so Back loses nothing. */
+  initial?: Step2Snapshot;
+  /** Validated - hand this screen's fields up and move to the next one. */
+  onNext: (part: SubmitRequestPart) => void;
+  /** Fires on every keystroke; the wizard is the one holding the answers. */
+  onChange: (snapshot: Step2Snapshot) => void;
   onBack: () => void;
+  /** The final submit is in flight - every screen's buttons go quiet. */
+  submitting?: boolean;
+  /** Field errors the server raised against this screen, after submit. */
+  serverErrors?: FieldErrors;
+  serverBanner?: string | null;
 }
 
 /**
- * Step 2 - identity verification.
+ * Screen 2 - identity verification.
  *
- * Nothing on this step is autosaved to browser storage, and no value here is
- * ever rendered back from the server. Military status is not asked: the MLA
- * covered-borrower check runs server-side.
+ * Nothing here is autosaved to browser storage and no value is ever rendered
+ * back from the server: an SSN and a licence number live in React state for
+ * as long as the applicant is on the form and nowhere else. Back and Next
+ * keep them in the wizard's memory, still in the same tab, and they leave the
+ * browser once - on submit.
+ *
+ * Military status is not asked: the MLA covered-borrower check runs
+ * server-side.
  */
 export function Step2({
-  applicationId,
   options,
   consentTemplates,
   residenceState,
-  onComplete,
+  initial,
+  onNext,
+  onChange,
   onBack,
+  submitting = false,
+  serverErrors,
+  serverBanner,
 }: Props) {
-  const [ssn, setSsn] = useState('');
-  const [confirmSsn, setConfirmSsn] = useState('');
-  const [dl, setDl] = useState('');
-  const [dlState, setDlState] = useState(residenceState ?? '');
-  const [dlExpiration, setDlExpiration] = useState('');
-  const [consents, setConsents] = useState<Record<string, boolean>>({});
+  const [ssn, setSsn] = useState(initial?.ssn ?? '');
+  const [confirmSsn, setConfirmSsn] = useState(initial?.confirmSsn ?? '');
+  const [dl, setDl] = useState(initial?.driversLicenseNumber ?? '');
+  const [dlState, setDlState] = useState(initial?.dlIssuingState ?? residenceState ?? '');
+  const [dlExpiration, setDlExpiration] = useState(initial?.dlExpirationDate ?? '');
+  const [consents, setConsents] = useState<Record<string, boolean>>(initial?.consents ?? {});
   const [errors, setErrors] = useState<FieldErrors>({});
   const [banner, setBanner] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+
+  // The wizard holds the answers; this screen only edits them.
+  useEffect(() => {
+    onChange({
+      ssn,
+      confirmSsn,
+      driversLicenseNumber: dl,
+      dlIssuingState: dlState,
+      dlExpirationDate: dlExpiration,
+      consents,
+    });
+  }, [ssn, confirmSsn, dl, dlState, dlExpiration, consents, onChange]);
+
+  // Errors raised by the server against this screen land here after submit.
+  useEffect(() => {
+    if (serverErrors && Object.keys(serverErrors).length) setErrors(serverErrors);
+    setBanner(serverBanner ?? null);
+  }, [serverErrors, serverBanner]);
 
   const setError = (key: string, message: string | null) =>
     setErrors((e) => ({ ...e, [key]: message ?? '' }));
@@ -80,7 +128,7 @@ export function Step2({
     return e;
   };
 
-  const submit = async (event: React.FormEvent) => {
+  const goNext = (event: React.FormEvent) => {
     event.preventDefault();
     setBanner(null);
 
@@ -93,45 +141,25 @@ export function Step2({
       return;
     }
 
-    setSubmitting(true);
-    try {
-      const result = await api.post<Step2Response>('/applications/step2', {
-        applicationId,
-        ssn: digitsOnly(ssn),
-        confirmSsn: digitsOnly(confirmSsn),
-        driversLicenseNumber: dl.trim().toUpperCase(),
-        dlIssuingState: dlState,
-        dlExpirationDate: dlExpiration,
-        consents: consentTemplates.map((t) => ({
-          type: t.type,
-          accepted: !!consents[t.type],
-          versionId: t.versionId,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        })),
-        tracking: getTracking(),
-      });
-
-      // Clear the sensitive values from component state the moment we are done.
-      setSsn('');
-      setConfirmSsn('');
-      onComplete(result);
-    } catch (err) {
-      if (err instanceof ApiRequestError) {
-        setErrors(err.fieldErrors);
-        setBanner(err.payload.message);
-      } else {
-        setBanner('Something went wrong. Please try again.');
-      }
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } finally {
-      setSubmitting(false);
-    }
+    onNext({
+      ssn: digitsOnly(ssn),
+      confirmSsn: digitsOnly(confirmSsn),
+      driversLicenseNumber: dl.trim().toUpperCase(),
+      dlIssuingState: dlState,
+      dlExpirationDate: dlExpiration,
+      consents: consentTemplates.map((t) => ({
+        type: t.type,
+        accepted: !!consents[t.type],
+        versionId: t.versionId,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      })),
+    });
   };
 
   const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
 
   return (
-    <form onSubmit={submit} noValidate className="space-y-6">
+    <form onSubmit={goNext} noValidate className="space-y-6">
       {banner && (
         <div role="alert" className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800">
           {banner}
@@ -139,8 +167,9 @@ export function Step2({
       )}
 
       <div className="rounded-lg border border-brand-200 bg-brand-50 p-4 text-sm text-brand-900">
-        <strong>Good news - you pre-qualify.</strong> We just need to confirm who you are before
-        we can make a final decision.
+        <strong>Nearly there.</strong> Federal law requires us to confirm who you are before we
+        can lend to you. You can still go back and change anything you have entered - nothing is
+        sent until you submit on the last screen.
       </div>
 
       <SectionCard
@@ -243,7 +272,8 @@ export function Step2({
         <button
           type="button"
           onClick={onBack}
-          className="rounded-lg border border-slate-300 px-6 py-4 text-base font-medium text-slate-700 transition hover:bg-slate-50 sm:w-auto"
+          disabled={submitting}
+          className="rounded-lg border border-slate-300 px-6 py-4 text-base font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
         >
           Back
         </button>
@@ -252,7 +282,7 @@ export function Step2({
           disabled={submitting}
           className="flex-1 rounded-lg bg-brand-600 px-6 py-4 text-base font-semibold text-white transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {submitting ? 'Verifying...' : 'Continue'}
+          Next
         </button>
       </div>
     </form>

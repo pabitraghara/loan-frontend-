@@ -1,9 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiRequestError } from '@/lib/api';
-import { getTracking } from '@/lib/tracking';
-import { clearAutosave, readAutosave, useAutosave } from '@/lib/useAutosave';
+import { api } from '@/lib/api';
 import {
   validateCurrency,
   validateDob,
@@ -21,7 +19,7 @@ import type {
   ConsentTemplate,
   FieldErrors,
   LookupOptions,
-  Step1Response,
+  SubmitRequestPart,
 } from '@/lib/types';
 import { SectionCard } from '../SectionCard';
 import { RegBNotice } from '../RegBNotice';
@@ -32,8 +30,6 @@ import { SelectField } from '../fields/SelectField';
 import { CurrencyField } from '../fields/CurrencyField';
 import { DateField } from '../fields/DateField';
 import { RadioGroup } from '../fields/RadioGroup';
-
-const AUTOSAVE_KEY = 'ryer.step1';
 
 interface Step1State {
   loanAmount: number;
@@ -68,6 +64,11 @@ interface Step1State {
   directDeposit: '' | 'yes' | 'no';
   additionalMonthlyIncome: number | undefined;
   additionalIncomeSource: string;
+}
+
+/** What the wizard holds on to so Back can put this screen back as it was. */
+export interface Step1Snapshot extends Step1State {
+  consents: Record<string, boolean>;
 }
 
 const initialState = (defaultAmount: number): Step1State => ({
@@ -108,10 +109,20 @@ const initialState = (defaultAmount: number): Step1State => ({
 interface Props {
   options: LookupOptions;
   consentTemplates: ConsentTemplate[];
-  /** Prefilled when resuming - rehydrates without losing anything. */
-  initial?: Partial<Step1State> & { applicationId?: string };
-  applicationId?: string;
-  onComplete: (result: Step1Response) => void;
+  /** Prefilled when Back brings the applicant here again. */
+  initial?: Partial<Step1Snapshot>;
+  /** Validated - hand this screen's fields up and move to the next one. */
+  onNext: (part: SubmitRequestPart) => void;
+  /**
+   * Fires on every keystroke. The wizard is the one holding the answers, so
+   * Back and the progress rail can never drop what was typed here.
+   */
+  onChange: (snapshot: Step1Snapshot) => void;
+  /** The final submit is in flight - every screen's buttons go quiet. */
+  submitting?: boolean;
+  /** Field errors the server raised against this screen, after submit. */
+  serverErrors?: FieldErrors;
+  serverBanner?: string | null;
   /** Keeps the quote rail in step with the slider and term dropdown. */
   onQuoteChange?: (amount: number, termMonths: number | '') => void;
 }
@@ -120,17 +131,21 @@ export function Step1({
   options,
   consentTemplates,
   initial,
-  applicationId,
-  onComplete,
+  onNext,
+  onChange,
+  submitting = false,
+  serverErrors,
+  serverBanner,
   onQuoteChange,
 }: Props) {
-  const [form, setForm] = useState<Step1State>(() => ({
-    ...initialState(options.loanAmount.default),
-    ...(initial ?? {}),
-  }));
+  const [form, setForm] = useState<Step1State>(() => {
+    const { consents: _ignored, ...rest } = initial ?? {};
+    return { ...initialState(options.loanAmount.default), ...rest };
+  });
   const [errors, setErrors] = useState<FieldErrors>({});
-  const [consents, setConsents] = useState<Record<string, boolean>>({});
-  const [submitting, setSubmitting] = useState(false);
+  const [consents, setConsents] = useState<Record<string, boolean>>(
+    () => initial?.consents ?? {},
+  );
   const [banner, setBanner] = useState<string | null>(null);
   const [emailSuggestion, setEmailSuggestion] = useState<string | null>(null);
   const [terms, setTerms] = useState<number[]>(options.loanTerms.map((t) => t.value));
@@ -140,15 +155,16 @@ export function Step1({
     note: null,
   });
 
-  // Local autosave for Step 1 only. Nothing sensitive lives on this step.
-  useAutosave(AUTOSAVE_KEY, form, !initial);
-
+  // The wizard holds the answers; this screen only edits them.
   useEffect(() => {
-    if (initial) return;
-    const saved = readAutosave<Step1State>(AUTOSAVE_KEY);
-    if (saved) setForm((f) => ({ ...f, ...saved }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    onChange({ ...form, consents });
+  }, [form, consents, onChange]);
+
+  // Errors raised by the server against this screen land here after submit.
+  useEffect(() => {
+    if (serverErrors && Object.keys(serverErrors).length) setErrors(serverErrors);
+    setBanner(serverBanner ?? null);
+  }, [serverErrors, serverBanner]);
 
   // Push the quote up whenever the two inputs that drive it change.
   useEffect(() => {
@@ -348,7 +364,7 @@ export function Step1({
     return e;
   };
 
-  const submit = async (event: React.FormEvent) => {
+  const goNext = (event: React.FormEvent) => {
     event.preventDefault();
     setBanner(null);
 
@@ -360,74 +376,54 @@ export function Step1({
       return;
     }
 
-    setSubmitting(true);
-    try {
-      const payload = {
-        applicationId,
-        loanAmount: form.loanAmount,
-        loanPurpose: form.loanPurpose,
-        loanPurposeOther: showPurposeOther ? form.loanPurposeOther.trim() : undefined,
-        loanTermMonths: Number(form.loanTermMonths),
-        firstName: form.firstName.trim(),
-        middleInitial: form.middleInitial || undefined,
-        lastName: form.lastName.trim(),
-        suffix: form.suffix || undefined,
-        email: form.email.trim().toLowerCase(),
-        confirmEmail: form.confirmEmail.trim().toLowerCase(),
-        phone: digitsOnly(form.phone),
-        dateOfBirth: form.dateOfBirth,
-        streetAddress: form.streetAddress.trim(),
-        aptUnit: form.aptUnit || undefined,
-        city: form.city.trim(),
-        state: form.state,
-        zipCode: form.zipCode,
-        timeAtCurrentAddress: form.timeAtCurrentAddress,
-        housingStatus: form.housingStatus,
-        monthlyHousingPayment: showHousingPayment ? form.monthlyHousingPayment : undefined,
-        employmentStatus: form.employmentStatus,
-        primaryIncomeType: showIncomeType ? form.primaryIncomeType : undefined,
-        employerName: showEmployerFields ? form.employerName.trim() : undefined,
-        jobTitle: showEmployerFields ? form.jobTitle.trim() : undefined,
-        employerPhone: showEmployerFields ? digitsOnly(form.employerPhone) : undefined,
-        timeAtCurrentJob: showEmployerFields ? form.timeAtCurrentJob : undefined,
-        netMonthlyIncome: form.netMonthlyIncome,
-        payFrequency: form.payFrequency,
-        nextPayDate: showNextPayDate ? form.nextPayDate : undefined,
-        directDeposit: form.directDeposit === 'yes',
-        additionalMonthlyIncome: form.additionalMonthlyIncome ?? 0,
-        additionalIncomeSource: showAdditionalSource
-          ? form.additionalIncomeSource.trim()
-          : undefined,
-        consents: consentTemplates.map((t) => ({
-          type: t.type,
-          accepted: !!consents[t.type],
-          versionId: t.versionId,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        })),
-        tracking: getTracking(),
-      };
-
-      const result = await api.post<Step1Response>('/applications/step1', payload);
-      clearAutosave(AUTOSAVE_KEY);
-      onComplete(result);
-    } catch (err) {
-      if (err instanceof ApiRequestError) {
-        setErrors(err.fieldErrors);
-        setBanner(err.payload.message);
-        if (err.payload.suggestions?.email) setEmailSuggestion(err.payload.suggestions.email);
-      } else {
-        setBanner('Something went wrong. Please try again.');
-      }
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } finally {
-      setSubmitting(false);
-    }
+    onNext({
+      loanAmount: form.loanAmount,
+      loanPurpose: form.loanPurpose,
+      loanPurposeOther: showPurposeOther ? form.loanPurposeOther.trim() : undefined,
+      loanTermMonths: Number(form.loanTermMonths),
+      firstName: form.firstName.trim(),
+      middleInitial: form.middleInitial || undefined,
+      lastName: form.lastName.trim(),
+      suffix: form.suffix || undefined,
+      email: form.email.trim().toLowerCase(),
+      confirmEmail: form.confirmEmail.trim().toLowerCase(),
+      phone: digitsOnly(form.phone),
+      dateOfBirth: form.dateOfBirth,
+      streetAddress: form.streetAddress.trim(),
+      aptUnit: form.aptUnit || undefined,
+      city: form.city.trim(),
+      state: form.state,
+      zipCode: form.zipCode,
+      timeAtCurrentAddress: form.timeAtCurrentAddress,
+      housingStatus: form.housingStatus,
+      monthlyHousingPayment: showHousingPayment ? form.monthlyHousingPayment : undefined,
+      employmentStatus: form.employmentStatus,
+      primaryIncomeType: showIncomeType ? form.primaryIncomeType : undefined,
+      employerName: showEmployerFields ? form.employerName.trim() : undefined,
+      jobTitle: showEmployerFields ? form.jobTitle.trim() : undefined,
+      employerPhone: showEmployerFields ? digitsOnly(form.employerPhone) : undefined,
+      timeAtCurrentJob: showEmployerFields ? form.timeAtCurrentJob : undefined,
+      netMonthlyIncome: form.netMonthlyIncome,
+      payFrequency: form.payFrequency,
+      nextPayDate: showNextPayDate ? form.nextPayDate : undefined,
+      directDeposit: form.directDeposit === 'yes',
+      additionalMonthlyIncome: form.additionalMonthlyIncome ?? 0,
+      additionalIncomeSource: showAdditionalSource
+        ? form.additionalIncomeSource.trim()
+        : undefined,
+      consents: consentTemplates.map((t) => ({
+        type: t.type,
+        accepted: !!consents[t.type],
+        versionId: t.versionId,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      })),
+    });
   };
 
   const suffixOptions = options.suffixes.filter((s) => s.value !== 'none');
 
   return (
-    <form onSubmit={submit} noValidate className="space-y-6">
+    <form onSubmit={goNext} noValidate className="space-y-6">
       {banner && (
         <div role="alert" className="rounded-lg border border-red-300 bg-red-50 p-4 text-sm text-red-800">
           {banner}
@@ -904,18 +900,20 @@ export function Step1({
         ))}
       </SectionCard>
 
-      <button
-        type="submit"
-        disabled={submitting}
-        className="w-full rounded-lg bg-brand-600 px-6 py-4 text-base font-semibold text-white
-                   transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
-      >
-        {submitting ? 'Checking your eligibility...' : 'See if I qualify'}
-      </button>
+      <div className="flex flex-col-reverse gap-3 sm:flex-row">
+        <button
+          type="submit"
+          disabled={submitting}
+          className="flex-1 rounded-lg bg-brand-600 px-6 py-4 text-base font-semibold text-white
+                     transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          Next
+        </button>
+      </div>
 
       <p className="pb-16 text-center text-xs text-slate-500 lg:pb-0">
-        Checking your eligibility uses a soft credit inquiry. It will not affect your credit
-        score, and it is not visible to other lenders.
+        Next just moves you on. Nothing is sent, and nothing is saved, until you submit on the
+        last screen - so please finish the form in one sitting.
       </p>
     </form>
   );

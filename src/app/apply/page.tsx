@@ -5,7 +5,7 @@ import { Container } from "@/components/Container";
 export const metadata: Metadata = {
   title: "Apply",
   description:
-    "Three short steps. Checking your eligibility will not affect your credit score.",
+    "Three short screens, one submission. Nothing is sent until you finish.",
   // An application page should never be indexed or archived.
   robots: { index: false, follow: false },
 };

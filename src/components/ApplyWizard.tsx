@@ -1,66 +1,131 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiRequestError, API_BASE } from "@/lib/api";
 import { getTracking, initTracking } from "@/lib/tracking";
-import { formatCurrency, formatCurrency2 } from "@/lib/format";
+import { formatCurrency } from "@/lib/format";
 import type {
   ConsentTemplate,
+  FieldErrors,
   LookupOptions,
-  Offer,
-  ResumeState,
-  Step1Response,
-  Step2Response,
-  Step3Response,
+  SubmitRequest,
+  SubmitRequestPart,
+  SubmitResponse,
 } from "@/lib/types";
-import { clearSession, readSession, saveSession } from "@/lib/session";
 import { ProgressIndicator } from "./ProgressIndicator";
 import { QuoteBar, QuoteSummary } from "./QuoteSummary";
 import { LeadCertificationScripts } from "./LeadCertificationScripts";
-import { Step1 } from "./steps/Step1";
-import { Step2 } from "./steps/Step2";
-import { Step3 } from "./steps/Step3";
+import { Step1, type Step1Snapshot } from "./steps/Step1";
+import { Step2, type Step2Snapshot } from "./steps/Step2";
+import { Step3, type Step3Snapshot } from "./steps/Step3";
 
 type Outcome =
   | { kind: "none" }
-  | { kind: "prequal_declined"; message?: string }
-  | { kind: "underwriting_declined" }
-  | { kind: "submitted"; result: Step3Response }
-  | { kind: "locked_out"; until?: string };
+  | { kind: "submitted"; result: SubmitResponse }
+  | { kind: "duplicate"; message: string; applicationId?: string };
 
-interface Props {
-  /** Present when arriving from a resume link. */
-  resumed?: ResumeState;
-  resumeToken?: string;
+/**
+ * Which screen a field lives on.
+ *
+ * The server tags errors it raises itself with their screen, but the request
+ * body is validated as one object before any of that runs - a shape error
+ * arrives untagged. This puts those on the right screen too, so the applicant
+ * is never shown a message about a field that is not in front of them.
+ */
+const SCREEN_FOR_FIELD: Record<string, 2 | 3> = {
+  ssn: 2,
+  confirmSsn: 2,
+  driversLicenseNumber: 2,
+  dlIssuingState: 2,
+  dlExpirationDate: 2,
+  routingNumber: 3,
+  bankName: 3,
+  accountNumber: 3,
+  confirmAccountNumber: 3,
+  accountType: 3,
+  accountStatusSelfReported: 3,
+  accountAge: 3,
+};
+
+/** The earliest screen any of these errors belongs to. */
+function screenFor(errors: FieldErrors): 1 | 2 | 3 {
+  let earliest: 1 | 2 | 3 = 3;
+  let found = false;
+  for (const field of Object.keys(errors)) {
+    const screen = SCREEN_FOR_FIELD[field] ?? 1;
+    found = true;
+    if (screen < earliest) earliest = screen;
+  }
+  return found ? earliest : 1;
 }
 
-export function ApplyWizard({ resumed, resumeToken }: Props) {
+/** What each screen has contributed to the one request body. */
+interface Parts {
+  1?: SubmitRequestPart;
+  2?: SubmitRequestPart;
+  3?: SubmitRequestPart;
+}
+
+/** What each screen last looked like, so Back puts it back untouched. */
+interface Snapshots {
+  1?: Step1Snapshot;
+  2?: Step2Snapshot;
+  3?: Step3Snapshot;
+}
+
+/**
+ * The application form: three screens, one submission.
+ *
+ * Next and Back move between the screens and nothing is posted on the way -
+ * the answers live here, in this component, until the applicant presses
+ * submit on the last screen. Then the whole application goes to
+ * POST /applications/submit in a single request and is stored in one write.
+ *
+ * Nothing is written to browser storage either, so a reload starts a clean
+ * form. That is the deliberate trade: no half-finished application anywhere,
+ * on the server or in the browser, and nothing to resume.
+ *
+ * The wizard rather than a screen owns the request, because a field error can
+ * come back against any of the three and the form has to be able to reopen
+ * the screen the error belongs to with the message on the right field.
+ */
+export function ApplyWizard() {
   const [options, setOptions] = useState<LookupOptions | null>(null);
   const [templates, setTemplates] = useState<ConsentTemplate[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const [state, setState] = useState<ResumeState | undefined>(resumed);
-  const [token, setToken] = useState<string | undefined>(resumeToken);
-  const [step, setStep] = useState<1 | 2 | 3>(
-    (resumed?.currentStep as 1 | 2 | 3) ?? 1,
-  );
-  const [highest, setHighest] = useState(resumed?.highestStepReached ?? 1);
-  const [applicationId, setApplicationId] = useState<string | undefined>(
-    resumed?.applicationId,
-  );
-  const [offer, setOffer] = useState<Offer | null>(resumed?.offer ?? null);
-  const [outcome, setOutcome] = useState<Outcome>({ kind: "none" });
-  const [notice, setNotice] = useState<string | null>(null);
-  const [restoring, setRestoring] = useState(!resumed);
+  const [step, setStep] = useState<1 | 2 | 3>(1);
 
-  /** Drives the quote rail. Step 1 pushes changes up as the slider moves. */
+  /**
+   * The answers, and what each screen looked like when it was left.
+   *
+   * Refs rather than state on purpose: these change on every keystroke, and
+   * nothing on the page is derived from them while a screen is open. Holding
+   * them in state would re-render the whole wizard on each character typed,
+   * and would hand each screen a fresh `initial` object as it went.
+   */
+  const parts = useRef<Parts>({});
+  const snapshots = useRef<Snapshots>({});
+
+  const [submitting, setSubmitting] = useState(false);
+  const [outcome, setOutcome] = useState<Outcome>({ kind: "none" });
+
+  /**
+   * Where a failed submit put its errors. Held per screen so the applicant
+   * can be sent back to screen 2 with the SSN field marked, rather than left
+   * on screen 3 with a message about a field they cannot see.
+   */
+  const [serverErrors, setServerErrors] = useState<{
+    step: 1 | 2 | 3;
+    message: string;
+    errors: FieldErrors;
+  } | null>(null);
+
+  /** Drives the quote rail. Screen 1 pushes changes up as the slider moves. */
   const [quote, setQuote] = useState<{
     amount: number;
     termMonths: number | "";
-  }>({
-    amount: resumed?.step1?.loanAmount ?? 10000,
-    termMonths: resumed?.step1?.loanTermMonths ?? "",
-  });
+  }>({ amount: 10000, termMonths: "" });
 
   const onQuoteChange = useCallback(
     (amount: number, termMonths: number | "") =>
@@ -107,191 +172,124 @@ export function ApplyWizard({ resumed, resumeToken }: Props) {
     loadForm();
   }, [loadForm]);
 
-  /**
-   * Restore an application in progress after a reload.
-   *
-   * Step 1 issues an application id and a resume token; without this the
-   * whole thing would be held in React state and a refresh would drop the
-   * applicant back to an empty Step 1. The saved answers come from the
-   * server, not from browser storage, so Steps 2 and 3 come back masked.
-   */
-  useEffect(() => {
-    if (resumed) return;
-    const saved = readSession();
-    if (!saved) {
-      setRestoring(false);
-      return;
-    }
-
-    api
-      .get<ResumeState>(
-        `/applications/resume/${encodeURIComponent(saved.resumeToken)}`,
-      )
-      .then((s) => {
-        setState(s);
-        setToken(saved.resumeToken);
-        setApplicationId(s.applicationId);
-        setHighest(s.highestStepReached);
-        setOffer(s.offer);
-        setQuote({
-          amount: s.offer?.amount ?? s.step1?.loanAmount ?? 10000,
-          termMonths: s.offer?.termMonths ?? s.step1?.loanTermMonths ?? "",
-        });
-        // Land them on the furthest step they can actually act on.
-        const target = Math.min(
-          Math.max(s.currentStep || 1, 1),
-          Math.max(s.highestStepReached || 1, 1),
-        ) as 1 | 2 | 3;
-        setStep(target);
-        if (target > 1) {
-          setNotice("Welcome back - we picked up where you left off.");
-        }
-      })
-      .catch(() => {
-        // Expired, purged or withdrawn: start clean rather than dead-end.
-        clearSession();
-      })
-      .finally(() => setRestoring(false));
-    // Runs once on mount. It must NOT depend on `state`, which it sets -
-    // that loops, hammers the resume endpoint until the rate limiter trips,
-    // and the failure path then wipes the saved session.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const templatesForStep = useCallback(
     (n: 1 | 2 | 3) => templates.filter((t) => t.step === n),
     [templates],
   );
 
-  // ---------------- step transitions
+  // ---------------- the answers live here
 
-  const onStep1Complete = (result: Step1Response) => {
-    setApplicationId(result.applicationId);
-    setOffer(result.offer);
-    setToken(result.resumeToken);
-    if (result.offer) {
-      setQuote({
-        amount: result.offer.amount,
-        termMonths: result.offer.termMonths,
-      });
-    }
-
-    if (result.prequalified) {
-      setHighest((h) => Math.max(h, 2));
-      setStep(2);
-      saveSession({
-        applicationId: result.applicationId,
-        resumeToken: result.resumeToken,
-        step: 2,
-        highestStepReached: 2,
-      });
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } else {
-      clearSession();
-      setOutcome({ kind: "prequal_declined" });
-    }
-  };
-
-  const onStep2Complete = (result: Step2Response) => {
-    if (result.approved) {
-      setOffer(result.offer ?? offer);
-      setHighest((h) => Math.max(h, 3));
-      setStep(3);
-      const nextToken = result.resumeToken ?? token;
-      if (nextToken) setToken(nextToken);
-      if (result.applicationId && nextToken) {
-        saveSession({
-          applicationId: result.applicationId,
-          resumeToken: nextToken,
-          step: 3,
-          highestStepReached: 3,
-        });
-      }
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } else {
-      clearSession();
-      setOutcome({ kind: "underwriting_declined" });
-    }
-  };
-
-  const onStep3Complete = (result: Step3Response) => {
-    // Nothing left to resume - verification continues by email.
-    clearSession();
-    setOutcome({ kind: "submitted", result });
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+  const onStep1Change = useCallback((s: Step1Snapshot) => {
+    snapshots.current[1] = s;
+  }, []);
+  const onStep2Change = useCallback((s: Step2Snapshot) => {
+    snapshots.current[2] = s;
+  }, []);
+  const onStep3Change = useCallback((s: Step3Snapshot) => {
+    snapshots.current[3] = s;
+  }, []);
 
   /**
-   * Back-navigation.
-   *
-   * Everything already entered stays saved server-side, including for someone
-   * who reached Step 3 and came back to Step 1. The server also emails a fresh
-   * resume link so they can return from anywhere.
+   * Deliberate navigation, which also drops a stale error from an earlier
+   * submit - the applicant has just been through the screen it was raised on.
    */
-  const goToStep = async (target: 1 | 2 | 3) => {
-    if (!applicationId) {
-      setStep(target);
-      return;
-    }
-    try {
-      const res = await api.post<{
-        currentStep: number;
-        resumeEmailSent: boolean;
-        resumeToken?: string;
-      }>(`/applications/${applicationId}/go-to-step/${target}`, {
-        tracking: getTracking(),
-      });
-      setStep(target);
-      if (res.resumeToken) setToken(res.resumeToken);
-      saveSession({
-        applicationId,
-        resumeToken: res.resumeToken ?? token ?? "",
-        step: target,
-        highestStepReached: highest,
-      });
-      setNotice(
-        res.resumeEmailSent
-          ? "Your progress is saved. We have emailed you a link so you can come back any time."
-          : "Your progress is saved.",
-      );
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    } catch (err) {
-      // Navigation must not be blocked by a failed nudge email.
-      setStep(target);
-      if (
-        err instanceof ApiRequestError &&
-        err.payload.code !== "STEP_NOT_REACHED"
-      ) {
-        setNotice("Your progress is saved.");
-      }
-    }
-  };
+  const goTo = useCallback((target: 1 | 2 | 3) => {
+    setStep(target);
+    setServerErrors(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }, []);
 
-  const step1Initial = useMemo(() => {
-    if (!state?.step1) return undefined;
-    const s = state.step1;
-    return {
-      ...s,
-      directDeposit:
-        s.directDeposit === true
-          ? "yes"
-          : s.directDeposit === false
-            ? "no"
-            : "",
-      monthlyHousingPayment:
-        s.monthlyHousingPayment == null
-          ? undefined
-          : Number(s.monthlyHousingPayment),
-      netMonthlyIncome:
-        s.netMonthlyIncome == null ? undefined : Number(s.netMonthlyIncome),
-      additionalMonthlyIncome:
-        s.additionalMonthlyIncome == null
-          ? undefined
-          : Number(s.additionalMonthlyIncome),
-      loanAmount: Number(s.loanAmount) || undefined,
-      loanTermMonths: s.loanTermMonths ?? "",
-    } as any;
-  }, [state]);
+  const onStep1Next = useCallback(
+    (part: SubmitRequestPart) => {
+      parts.current[1] = part;
+      goTo(2);
+    },
+    [goTo],
+  );
+
+  const onStep2Next = useCallback(
+    (part: SubmitRequestPart) => {
+      parts.current[2] = part;
+      goTo(3);
+    },
+    [goTo],
+  );
+
+  // ---------------- the one submit
+
+  /**
+   * Everything the applicant entered, in one request.
+   *
+   * The consents from all three screens go up in a single array; the server
+   * splits them back out by the screen each checkbox was shown on, so the
+   * evidence rows are unchanged.
+   */
+  const onSubmitAll = useCallback(
+    async (step3Part: SubmitRequestPart) => {
+      parts.current[3] = step3Part;
+      setServerErrors(null);
+      setSubmitting(true);
+
+      const body = {
+        ...parts.current[1],
+        ...parts.current[2],
+        ...step3Part,
+        consents: [
+          ...(parts.current[1]?.consents ?? []),
+          ...(parts.current[2]?.consents ?? []),
+          ...(step3Part.consents ?? []),
+        ],
+        tracking: getTracking(),
+      } as SubmitRequest;
+
+      try {
+        const result = await api.post<SubmitResponse>(
+          "/applications/submit",
+          body,
+        );
+        setOutcome({ kind: "submitted", result });
+      } catch (err) {
+        if (err instanceof ApiRequestError) {
+          if (err.payload.code === "DUPLICATE_APPLICATION") {
+            setOutcome({
+              kind: "duplicate",
+              message: err.payload.message,
+              applicationId: err.payload.applicationId,
+            });
+            return;
+          }
+          // The server tags field errors with the screen they belong to.
+          // An untagged one came from the request-body check that runs before
+          // any of that, so fall back to where the fields themselves live.
+          const target = (err.payload.step ?? screenFor(err.fieldErrors)) as
+            | 1
+            | 2
+            | 3;
+          setServerErrors({
+            step: target,
+            message: err.payload.message,
+            errors: err.fieldErrors,
+          });
+          if (target !== step) setStep(target);
+        } else {
+          setServerErrors({
+            step,
+            message: "Something went wrong. Please try again.",
+            errors: {},
+          });
+        }
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [step],
+  );
+
+  const errorsFor = (n: 1 | 2 | 3) =>
+    serverErrors?.step === n ? serverErrors.errors : undefined;
+  const bannerFor = (n: 1 | 2 | 3) =>
+    serverErrors?.step === n ? serverErrors.message : null;
 
   // ---------------- render
 
@@ -332,7 +330,7 @@ export function ApplyWizard({ resumed, resumeToken }: Props) {
     );
   }
 
-  if (!options || restoring) {
+  if (!options) {
     return (
       <div className="space-y-4" aria-busy="true">
         <div className="h-8 w-40 animate-pulse rounded bg-slate-200" />
@@ -342,37 +340,24 @@ export function ApplyWizard({ resumed, resumeToken }: Props) {
     );
   }
 
-  if (
-    outcome.kind === "prequal_declined" ||
-    outcome.kind === "underwriting_declined"
-  ) {
-    return <DeclineScreen applicationId={applicationId} />;
-  }
-
-  if (outcome.kind === "submitted") {
+  if (outcome.kind === "duplicate") {
     return (
-      <SubmittedScreen result={outcome.result} applicationId={applicationId!} />
+      <DuplicateScreen
+        message={outcome.message}
+        applicationId={outcome.applicationId}
+      />
     );
   }
 
-  const railAmount = offer?.amount ?? quote.amount;
-  const railTerm = offer?.termMonths ?? quote.termMonths;
+  if (outcome.kind === "submitted") {
+    return <SubmittedScreen result={outcome.result} />;
+  }
 
   return (
     <>
       <LeadCertificationScripts />
 
-      <ProgressIndicator
-        current={step}
-        highestReached={highest}
-        onNavigate={goToStep}
-      />
-
-      {notice && (
-        <div className="mb-6 rounded-lg border border-brand-200 bg-brand-50 p-4 text-sm text-brand-900">
-          {notice}
-        </div>
-      )}
+      <ProgressIndicator current={step} onNavigate={goTo} />
 
       {/* Form on the left, live quote on the right. On narrow screens the
           quote collapses to a pinned bar so the payment is never off-screen. */}
@@ -382,107 +367,158 @@ export function ApplyWizard({ resumed, resumeToken }: Props) {
             <Step1
               options={options}
               consentTemplates={templatesForStep(1)}
-              initial={step1Initial}
-              applicationId={applicationId}
-              onComplete={onStep1Complete}
+              initial={snapshots.current[1]}
+              onNext={onStep1Next}
+              onChange={onStep1Change}
+              submitting={submitting}
+              serverErrors={errorsFor(1)}
+              serverBanner={bannerFor(1)}
               onQuoteChange={onQuoteChange}
             />
           )}
 
-          {step === 2 && applicationId && (
+          {step === 2 && (
             <Step2
-              applicationId={applicationId}
               options={options}
               consentTemplates={templatesForStep(2)}
-              residenceState={state?.step1?.state}
-              onComplete={onStep2Complete}
-              onBack={() => goToStep(1)}
+              residenceState={snapshots.current[1]?.state}
+              initial={snapshots.current[2]}
+              onNext={onStep2Next}
+              onChange={onStep2Change}
+              onBack={() => goTo(1)}
+              submitting={submitting}
+              serverErrors={errorsFor(2)}
+              serverBanner={bannerFor(2)}
             />
           )}
 
-          {step === 3 && applicationId && (
+          {step === 3 && (
             <Step3
-              applicationId={applicationId}
               options={options}
               consentTemplates={templatesForStep(3)}
-              offer={offer}
-              onComplete={onStep3Complete}
-              onBack={() => goToStep(2)}
+              requestedAmount={quote.amount}
+              initial={snapshots.current[3]}
+              onSubmit={onSubmitAll}
+              onChange={onStep3Change}
+              onBack={() => goTo(2)}
+              submitting={submitting}
+              serverErrors={errorsFor(3)}
+              serverBanner={bannerFor(3)}
             />
           )}
         </div>
 
         <div className="hidden lg:block">
           <QuoteSummary
-            amount={railAmount}
-            termMonths={railTerm}
-            approved={!!offer && step === 3}
+            amount={quote.amount}
+            termMonths={quote.termMonths}
             step={step}
           />
         </div>
       </div>
 
-      <QuoteBar amount={railAmount} termMonths={railTerm} />
+      <QuoteBar amount={quote.amount} termMonths={quote.termMonths} />
     </>
   );
 }
 
-function DeclineScreen({ applicationId }: { applicationId?: string }) {
+/**
+ * One application per applicant. The reference is shown so they can look it
+ * up rather than be left wondering which one we already hold.
+ */
+function DuplicateScreen({
+  message,
+  applicationId,
+}: {
+  message: string;
+  applicationId?: string;
+}) {
   return (
     <div className="space-y-5 rounded-xl border border-slate-200 bg-white p-6">
       <h1 className="text-2xl font-semibold text-brand-900">
-        We are not able to move forward right now
+        We already have an application for you
       </h1>
-      <p className="text-sm leading-relaxed text-slate-600">
-        Thank you for considering us. After reviewing the information you
-        provided, we cannot offer you a loan at this time.
-      </p>
-      <p className="text-sm leading-relaxed text-slate-600">
-        You will receive a written statement of the specific reasons by email,
-        as required by the Equal Credit Opportunity Act. If you believe
-        something was entered incorrectly, call us on{" "}
-        {process.env.NEXT_PUBLIC_SUPPORT_PHONE || "(800) 555-0143"}.
-      </p>
+      <p className="text-sm leading-relaxed text-slate-600">{message}</p>
       {applicationId && (
         <p className="rounded-lg bg-slate-50 px-4 py-3 text-sm text-slate-700">
           Your reference: <strong>{applicationId}</strong>
         </p>
       )}
+      <a
+        href="/loan-status"
+        className="inline-block rounded-lg bg-brand-600 px-6 py-3 text-sm font-semibold text-white transition hover:bg-brand-700"
+      >
+        Check my application status
+      </a>
     </div>
   );
 }
 
-function SubmittedScreen({
-  result,
-  applicationId,
-}: {
-  result: Step3Response;
-  applicationId: string;
-}) {
+/**
+ * The end of the form.
+ *
+ * No decision is made here and none is implied - the application is in, and
+ * the one thing still outstanding is the applicant confirming their bank
+ * account from the email we have just sent.
+ */
+function SubmittedScreen({ result }: { result: SubmitResponse }) {
   return (
     <div className="space-y-5 rounded-xl border border-brand-300 bg-white p-6">
       <div className="text-4xl" aria-hidden="true">
         ✅
       </div>
       <h1 className="text-2xl font-semibold text-brand-900">
-        That&apos;s everything we need
+        Application received
       </h1>
 
-      <p className="text-sm leading-relaxed text-slate-600">
-        We have your funding details for{" "}
-        <strong>{result.bankName || "your bank"}</strong>, account ending{" "}
-        <strong>{result.accountNumberMasked}</strong>.
-      </p>
-
-      <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm leading-relaxed text-amber-900">
-        <strong>One last step:</strong> check your email and click the
-        verification link to confirm this account belongs to you. We have just
-        sent it, and we will send reminders over the next three days if we do
-        not hear from you.
+      <div className="rounded-xl border border-amber-300 bg-amber-50 p-5">
+        <p className="text-xs font-semibold uppercase tracking-wider text-amber-800">
+          Status
+        </p>
+        <p className="mt-1 text-2xl font-semibold tracking-tight text-amber-900">
+          {result.statusLabel || "Bank Verification Pending"}
+        </p>
+        <p className="mt-2 text-sm leading-relaxed text-amber-900">
+          <strong>One last step:</strong> check your email and click the
+          verification link to confirm your bank account belongs to you. We
+          have just sent it, and we will send reminders over the next three
+          days if we do not hear from you.
+        </p>
       </div>
 
-      <p className="rounded-lg bg-slate-50 px-4 py-3 text-sm text-slate-700">
-        Your reference: <strong>{applicationId}</strong>
+      <dl className="divide-y divide-slate-100 rounded-lg bg-slate-50 px-4">
+        <div className="flex items-baseline justify-between py-3">
+          <dt className="text-sm text-slate-500">Your reference</dt>
+          <dd className="text-sm font-semibold text-brand-900">
+            {result.applicationId}
+          </dd>
+        </div>
+        {result.loanAmount != null && (
+          <div className="flex items-baseline justify-between py-3">
+            <dt className="text-sm text-slate-500">Amount requested</dt>
+            <dd className="text-sm font-medium text-slate-800">
+              {formatCurrency(result.loanAmount)}
+              {result.loanTermMonths
+                ? ` over ${result.loanTermMonths} months`
+                : ""}
+            </dd>
+          </div>
+        )}
+        <div className="flex items-baseline justify-between py-3">
+          <dt className="text-sm text-slate-500">Deposit account</dt>
+          <dd className="text-sm font-medium text-slate-800">
+            {result.bankName || "Your bank"}, ending{" "}
+            {result.accountNumberMasked}
+          </dd>
+        </div>
+      </dl>
+
+      <p className="text-sm leading-relaxed text-slate-600">
+        Keep your reference safe - you can check your application on our{" "}
+        <a href="/loan-status" className="font-medium text-brand-700 underline">
+          Loan Status
+        </a>{" "}
+        page at any time.
       </p>
 
       <p className="text-xs leading-relaxed text-slate-500">
@@ -495,4 +531,4 @@ function SubmittedScreen({
   );
 }
 
-export { formatCurrency, formatCurrency2 };
+export { formatCurrency };

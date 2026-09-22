@@ -9,7 +9,7 @@ export function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     "/admin/:path*",
-    // "/apply/:path*",
+    "/apply/:path*",
     // "/contact/:path*",
     // "/faq/:path*",
     // "/how-it-works/:path*",

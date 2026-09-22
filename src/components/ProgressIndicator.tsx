@@ -2,7 +2,6 @@
 
 interface Props {
   current: 1 | 2 | 3;
-  highestReached: number;
   onNavigate?: (step: 1 | 2 | 3) => void;
 }
 
@@ -14,10 +13,13 @@ const STEPS = [
 
 /**
  * "Step 1 of 3", with a rail that shows what is done, where you are, and what
- * is still to come. Completed steps are clickable: going back never loses
- * data, so there is no reason to trap someone on the current step.
+ * is still to come.
+ *
+ * Completed steps are clickable: going back never loses data, so there is no
+ * reason to trap someone on the current step. Going forward is not - that is
+ * what Next is for, and skipping ahead would skip the validation Next runs.
  */
-export function ProgressIndicator({ current, highestReached, onNavigate }: Props) {
+export function ProgressIndicator({ current, onNavigate }: Props) {
   const pct = ((current - 1) / (STEPS.length - 1)) * 100;
 
   return (
@@ -43,7 +45,7 @@ export function ProgressIndicator({ current, highestReached, onNavigate }: Props
           {STEPS.map((s) => {
             const done = s.n < current;
             const active = s.n === current;
-            const reachable = s.n <= highestReached && s.n !== current && !!onNavigate;
+            const reachable = s.n < current && !!onNavigate;
 
             return (
               <li key={s.n} className="flex flex-col items-center">

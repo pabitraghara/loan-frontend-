@@ -1,16 +1,14 @@
 'use client';
 
-import { useState } from 'react';
-import { api, ApiRequestError } from '@/lib/api';
-import { getTracking } from '@/lib/tracking';
-import { digitsOnly, formatCurrency, formatCurrency2 } from '@/lib/format';
+import { useEffect, useState } from 'react';
+import { api } from '@/lib/api';
+import { digitsOnly, formatCurrency } from '@/lib/format';
 import { validateAccountNumber, validateRoutingNumber, required } from '@/lib/validation';
 import type {
   ConsentTemplate,
   FieldErrors,
   LookupOptions,
-  Offer,
-  Step3Response,
+  SubmitRequestPart,
 } from '@/lib/types';
 import { SectionCard } from '../SectionCard';
 import { TrustMarkers } from '../TrustMarkers';
@@ -19,43 +17,101 @@ import { TextField } from '../fields/TextField';
 import { SelectField } from '../fields/SelectField';
 import { RadioGroup } from '../fields/RadioGroup';
 
+/** What the wizard holds on to so Back can put this screen back as it was. */
+export interface Step3Snapshot {
+  routingNumber: string;
+  bankName: string;
+  accountNumber: string;
+  confirmAccountNumber: string;
+  accountType: '' | 'checking' | 'savings';
+  accountStatusSelfReported: string;
+  accountAge: string;
+  consents: Record<string, boolean>;
+}
+
 interface Props {
-  applicationId: string;
   options: LookupOptions;
   consentTemplates: ConsentTemplate[];
-  offer: Offer | null;
-  onComplete: (result: Step3Response) => void;
+  /** The amount asked for, so the last screen still shows what it is funding. */
+  requestedAmount?: number;
+  /** Whatever was on this screen last time, so Back loses nothing. */
+  initial?: Step3Snapshot;
+  /** Validated - this is the one that sends the whole application. */
+  onSubmit: (part: SubmitRequestPart) => void;
+  /** Fires on every keystroke; the wizard is the one holding the answers. */
+  onChange: (snapshot: Step3Snapshot) => void;
   onBack: () => void;
+  /** The submit is in flight. */
+  submitting?: boolean;
+  /** Field errors the server raised against this screen, after submit. */
+  serverErrors?: FieldErrors;
+  serverBanner?: string | null;
 }
 
 /**
- * Step 3 - bank & funding.
+ * Screen 3 - bank & funding, and the screen that submits.
  *
  * Instant Account Verification (Plaid / MX / Finicity) is not used on this
  * build; these manual fields are the only path. The bank name is looked up
  * from the routing number and rendered read-only - we never ask the applicant
- * to type it.
+ * to type it. The routing lookup is the only request this screen makes before
+ * the applicant presses submit, which is the one that stores the application.
  */
 export function Step3({
-  applicationId,
   options,
   consentTemplates,
-  offer,
-  onComplete,
+  requestedAmount,
+  initial,
+  onSubmit,
+  onChange,
   onBack,
+  submitting = false,
+  serverErrors,
+  serverBanner,
 }: Props) {
-  const [routing, setRouting] = useState('');
-  const [bankName, setBankName] = useState('');
+  const [routing, setRouting] = useState(initial?.routingNumber ?? '');
+  const [bankName, setBankName] = useState(initial?.bankName ?? '');
   const [lookingUp, setLookingUp] = useState(false);
-  const [account, setAccount] = useState('');
-  const [confirmAccount, setConfirmAccount] = useState('');
-  const [accountType, setAccountType] = useState<'' | 'checking' | 'savings'>('');
-  const [accountStatus, setAccountStatus] = useState('');
-  const [accountAge, setAccountAge] = useState('');
-  const [consents, setConsents] = useState<Record<string, boolean>>({});
+  const [account, setAccount] = useState(initial?.accountNumber ?? '');
+  const [confirmAccount, setConfirmAccount] = useState(initial?.confirmAccountNumber ?? '');
+  const [accountType, setAccountType] = useState<'' | 'checking' | 'savings'>(
+    initial?.accountType ?? '',
+  );
+  const [accountStatus, setAccountStatus] = useState(initial?.accountStatusSelfReported ?? '');
+  const [accountAge, setAccountAge] = useState(initial?.accountAge ?? '');
+  const [consents, setConsents] = useState<Record<string, boolean>>(initial?.consents ?? {});
   const [errors, setErrors] = useState<FieldErrors>({});
   const [banner, setBanner] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+
+  // The wizard holds the answers; this screen only edits them.
+  useEffect(() => {
+    onChange({
+      routingNumber: routing,
+      bankName,
+      accountNumber: account,
+      confirmAccountNumber: confirmAccount,
+      accountType,
+      accountStatusSelfReported: accountStatus,
+      accountAge,
+      consents,
+    });
+  }, [
+    routing,
+    bankName,
+    account,
+    confirmAccount,
+    accountType,
+    accountStatus,
+    accountAge,
+    consents,
+    onChange,
+  ]);
+
+  // Errors raised by the server against this screen land here after submit.
+  useEffect(() => {
+    if (serverErrors && Object.keys(serverErrors).length) setErrors(serverErrors);
+    setBanner(serverBanner ?? null);
+  }, [serverErrors, serverBanner]);
 
   const setError = (key: string, message: string | null) =>
     setErrors((e) => ({ ...e, [key]: message ?? '' }));
@@ -114,7 +170,7 @@ export function Step3({
     return e;
   };
 
-  const submit = async (event: React.FormEvent) => {
+  const submit = (event: React.FormEvent) => {
     event.preventDefault();
     setBanner(null);
 
@@ -127,40 +183,24 @@ export function Step3({
       return;
     }
 
-    setSubmitting(true);
-    try {
-      const result = await api.post<Step3Response>('/applications/step3', {
-        applicationId,
-        routingNumber: digitsOnly(routing),
-        bankName: bankName || undefined,
-        accountNumber: digitsOnly(account),
-        confirmAccountNumber: digitsOnly(confirmAccount),
-        accountType,
-        accountStatusSelfReported: accountStatus,
-        accountAge,
-        consents: consentTemplates.map((t) => ({
-          type: t.type,
-          accepted: !!consents[t.type],
-          versionId: t.versionId,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        })),
-        tracking: getTracking(),
-      });
-
-      setAccount('');
-      setConfirmAccount('');
-      onComplete(result);
-    } catch (err) {
-      if (err instanceof ApiRequestError) {
-        setErrors(err.fieldErrors);
-        setBanner(err.payload.message);
-      } else {
-        setBanner('Something went wrong. Please try again.');
-      }
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } finally {
-      setSubmitting(false);
-    }
+    // This hands the last of the answers to the wizard, which posts all three
+    // screens together. The wizard owns the request, because a field error can
+    // come back against any of them.
+    onSubmit({
+      routingNumber: digitsOnly(routing),
+      bankName: bankName || undefined,
+      accountNumber: digitsOnly(account),
+      confirmAccountNumber: digitsOnly(confirmAccount),
+      accountType,
+      accountStatusSelfReported: accountStatus,
+      accountAge,
+      consents: consentTemplates.map((t) => ({
+        type: t.type,
+        accepted: !!consents[t.type],
+        versionId: t.versionId,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      })),
+    });
   };
 
   return (
@@ -171,28 +211,21 @@ export function Step3({
         </div>
       )}
 
-      {offer && (
-        <div className="rounded-xl border border-brand-300 bg-brand-50 p-5">
-          <p className="text-sm font-semibold text-brand-900">You&apos;re approved</p>
-          <p className="mt-1 text-3xl font-semibold tracking-tight text-brand-900">
-            {formatCurrency(offer.amount)}
-          </p>
-          <dl className="mt-3 grid grid-cols-3 gap-3 text-sm text-brand-900">
-            <div>
-              <dt className="text-xs text-brand-700">Term</dt>
-              <dd className="font-medium">{offer.termMonths} months</dd>
-            </div>
-            <div>
-              <dt className="text-xs text-brand-700">APR</dt>
-              <dd className="font-medium">{offer.apr}%</dd>
-            </div>
-            <div>
-              <dt className="text-xs text-brand-700">Payment</dt>
-              <dd className="font-medium">{formatCurrency2(offer.installment)}</dd>
-            </div>
-          </dl>
-        </div>
-      )}
+      {/* No decision is made on submit, so this promises none. What actually
+          happens next is the bank verification email. */}
+      <div className="rounded-xl border border-brand-300 bg-brand-50 p-5">
+        <p className="text-sm font-semibold text-brand-900">Last screen</p>
+        <p className="mt-1 text-sm leading-relaxed text-brand-900">
+          Tell us where to deposit{' '}
+          {requestedAmount ? (
+            <strong>{formatCurrency(requestedAmount)}</strong>
+          ) : (
+            'your loan'
+          )}
+          . When you submit, we email you a link to confirm this account is yours - that is the
+          last thing we need from you.
+        </p>
+      </div>
 
       <SectionCard
         title="Where should we send the money?"
@@ -313,7 +346,8 @@ export function Step3({
         <button
           type="button"
           onClick={onBack}
-          className="rounded-lg border border-slate-300 px-6 py-4 text-base font-medium text-slate-700 transition hover:bg-slate-50 sm:w-auto"
+          disabled={submitting}
+          className="rounded-lg border border-slate-300 px-6 py-4 text-base font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
         >
           Back
         </button>
@@ -322,7 +356,7 @@ export function Step3({
           disabled={submitting}
           className="flex-1 rounded-lg bg-brand-600 px-6 py-4 text-base font-semibold text-white transition hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {submitting ? 'Submitting...' : 'Finish my application'}
+          {submitting ? 'Submitting your application...' : 'Submit my application'}
         </button>
       </div>
     </form>
